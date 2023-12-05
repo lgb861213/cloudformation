@@ -2,4 +2,6 @@ For cost reasons, large noetbooks will be closed when not in use and will be ope
 
 solution
 
+![image]([https://github.com/lgb861213/cloudformation/blob/main/solution.png])
+
 
