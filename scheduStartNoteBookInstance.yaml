@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  NotebookInstanceName:
+    Type: String
+    Description: The name of the SageMaker Notebook instance to start
+  EmailSubscription:
+    Type: String
+    Description: The email address to subscribe to the SNS topic
+  EventBridgeRuleName:
+    Type: String
+    Description: The name of the EventBridge rule
+  ScheduleExpression:
+    Type: String
+    Description: The schedule expression for the EventBridge rule
+    Default: "cron(*/10 * * * ? *)"
+
+Resources:
+  StartSageMakerNotebookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StartSageMakerNotebook
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt StartSageMakerNotebookLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          def lambda_handler(event, context):
+              # Start SageMaker Notebook instance
+              notebook_instance_name = event['NotebookInstanceName']
+              sns_topic_arn = event['SNSTopicARN']
+              event_bridge_rule_name = event['EventBridgeRuleName']
+
+              sm_client = boto3.client('sagemaker')
+              response = sm_client.start_notebook_instance(NotebookInstanceName=notebook_instance_name)
+
+              # Wait for the notebook instance to become 'InService'
+              waiter = sm_client.get_waiter('notebook_instance_in_service')
+              waiter.wait(NotebookInstanceName=notebook_instance_name)
+
+              # Check if the notebook instance started successfully
+              instance_status = sm_client.describe_notebook_instance(NotebookInstanceName=notebook_instance_name)['NotebookInstanceStatus']
+              if instance_status == 'InService':
+                  # Send SNS notification
+                  sns_client = boto3.client('sns')
+                  sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Message='SageMaker Notebook instance has been started'
+                  )
+
+                  # Disable EventBridge rule
+                  eventbridge_client = boto3.client('events')
+                  eventbridge_client.disable_rule(Name=event_bridge_rule_name)
+
+  StartSageMakerNotebookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StartSageMakerNotebookLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartSageMakerNotebookLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:StartNotebookInstance
+                  - sns:Publish
+                  - events:DisableRule
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - sagemaker:DescribeNotebookInstance
+                Resource: '*'
+
+  StartSageMakerNotebookTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+     DisplayName: StartSageMakerNotebookTopic
+
+  StartSageMakerNotebookEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref StartSageMakerNotebookTopic
+      Protocol: email
+      Endpoint: !Ref EmailSubscription
+
+  StartSageMakerNotebookEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref EventBridgeRuleName
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StartSageMakerNotebookLambda.Arn
+          Id: StartSageMakerNotebookLambdaTarget
+          InputTransformer:
+            InputPathsMap:
+              NotebookInstanceName: "$.detail.NotebookInstanceName"
+              SNSTopicARN: "$.detail.SNSTopicArn"
+              EventBridgeRuleName: "$.detail.EventBridgeRuleName"
+            InputTemplate: !Sub |
+              {
+                "NotebookInstanceName": "${NotebookInstanceName}",
+                "SNSTopicARN": "${StartSageMakerNotebookTopic}",
+                "EventBridgeRuleName": "${EventBridgeRuleName}"
+              }
+  StartSageMakerNotebookEventRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartSageMakerNotebookLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartSageMakerNotebookEventRule.Arn
+
+Outputs:
+  StartSageMakerNotebookTopicArn:
+    Value: !Ref StartSageMakerNotebookTopic
+  StartSageMakerNotebookEventRuleArn:
+    Value: !Ref StartSageMakerNotebookEventRule
